@@ -1,0 +1,709 @@
+#PROCESS ORIENTED MODELS
+import gzip
+import csv
+import random
+import networkx as nx
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+# ===============================
+# PARAMETERS
+# ===============================
+T_SNAPSHOTS = 10
+K_VALUES = [8, 12, 16, 20]
+MAX_STEPS = 8
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+# ===============================
+# HELPER FUNCTIONS TO LOAD DATA
+# ===============================
+def load_snap_txt_gz(path):
+    edges = []
+    with gzip.open(path, "rt") as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+            u, v, t = line.strip().split()[:3]
+            edges.append((int(u), int(v), int(float(t))))
+    return edges
+
+def load_snap_csv_gz(path, min_positive=1):
+    edges = []
+    with gzip.open(path, "rt") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if row[0].startswith('#') or len(row)<4:
+                continue
+            u, v, rating, t = row[:4]
+            if int(rating) >= min_positive:
+                edges.append((int(u), int(v), int(float(t))))
+    return edges
+
+def build_time_snapshots(edges, n_snapshots=T_SNAPSHOTS):
+    if not edges:
+        return [nx.DiGraph() for _ in range(n_snapshots)]
+
+    all_nodes = set(u for u,v,_ in edges) | set(v for u,v,_ in edges)
+    times = [t for _,_,t in edges]
+    tmin, tmax = min(times), max(times)+1
+    interval = (tmax - tmin)/n_snapshots
+    snapshots = []
+
+    for i in range(n_snapshots):
+        G = nx.DiGraph()
+        G.add_nodes_from(all_nodes)
+        snap_start = tmin + i*interval
+        snap_end = tmin + (i+1)*interval
+        for u, v, t in edges:
+            if snap_start <= t < snap_end:
+                G.add_edge(u, v)
+        snapshots.append(G)
+    return snapshots
+
+# ===============================
+# LOAD DATASETS
+# ===============================
+datasets = {}
+datasets["CollegeMsg"] = build_time_snapshots(load_snap_txt_gz("Datasets/CollegeMsg.txt.gz"))
+datasets["Email-Eu-Core"] = build_time_snapshots(load_snap_txt_gz("Datasets/email-Eu-core-temporal.txt.gz"))
+datasets["Bitcoin-OTC"] = build_time_snapshots(load_snap_csv_gz("Datasets/soc-sign-bitcoinotc.csv.gz"))
+datasets["Bitcoin-Alpha"] = build_time_snapshots(load_snap_csv_gz("Datasets/soc-sign-bitcoinalpha.csv.gz"))
+
+# ===============================
+# DIFFUSION MODELS
+# ===============================
+
+# ----- Standard Models -----
+def IC(G, seeds, p=0.2):
+    """Independent Cascade model."""
+    active = set(seeds)
+    frontier = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            for v in G.successors(u):
+                if v not in active and random.random() < p:
+                    new.add(v)
+        if not new: break
+        active |= new
+        frontier = new
+    return active
+
+def LT(G, seeds):
+    """Linear Threshold model."""
+    thresholds = {v: random.random() for v in G.nodes()}
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                if preds and len(set(preds)&active)/len(preds) >= thresholds[v]:
+                    new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+def SI(G, seeds, beta=0.3):
+    """Susceptible-Infected model."""
+    infected = set(seeds)
+    frontier = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            for v in G.successors(u):
+                if v not in infected and random.random() < beta:
+                    new.add(v)
+        if not new: break
+        infected |= new
+        frontier = new
+    return infected
+
+def SIR(G, seeds, beta=0.3, gamma=0.2):
+    """SIR model with infection beta and recovery gamma."""
+    I = set(seeds)
+    R = set()
+    frontier = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            for v in G.successors(u):
+                if v not in I and v not in R and random.random() < beta:
+                    new.add(v)
+            if random.random() < gamma:
+                R.add(u)
+        if not new: break
+        I |= new
+        frontier = new
+    return I | R
+
+def SEIR(G, seeds, beta=0.3, sigma=0.3, gamma=0.2):
+    """SEIR model: Susceptible -> Exposed -> Infected -> Recovered."""
+    S = set(G.nodes()) - set(seeds)
+    E = set(seeds)
+    I, R = set(), set()
+    for _ in range(MAX_STEPS):
+        newE, newI, newR = set(), set(), set()
+        for u in I:
+            for v in G.successors(u):
+                if v in S and random.random() < beta:
+                    newE.add(v)
+            if random.random() < gamma:
+                newR.add(u)
+        for u in E:
+            if random.random() < sigma:
+                newI.add(u)
+        if not (newE or newI): break
+        S -= newE
+        E |= newE
+        E -= newI
+        I |= newI
+        I -= newR
+        R |= newR
+    return E | I | R
+
+def SCIR(G, seeds, beta=0.3):
+    """SIR with degree-normalized infection probability."""
+    infected = set(seeds)
+    frontier = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            for v in G.successors(u):
+                prob = beta / max(1, G.in_degree(v))
+                if v not in infected and random.random() < prob:
+                    new.add(v)
+        if not new: break
+        infected |= new
+        frontier = new
+    return infected
+
+def cpSIR(G, seeds, beta=0.3):
+    """SIR variant with one random neighbor infection per step."""
+    I = set(seeds)
+    R = set()
+    frontier = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            nbrs = list(G.successors(u))
+            if nbrs:
+                v = random.choice(nbrs)
+                if v not in I and v not in R and random.random() < beta:
+                    new.add(v)
+            R.add(u)
+        if not new: break
+        I |= new
+        frontier = new
+    return I | R
+
+def FSIR(G, seeds, beta=0.25, gamma=0.1):
+    """Fractional SIR: lower probability spread."""
+    I = set(seeds)
+    R = set()
+    frontier = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            for v in G.successors(u):
+                if v not in I and v not in R and random.random() < beta/2:
+                    new.add(v)
+            if random.random() < gamma:
+                R.add(u)
+        if not new: break
+        I |= new
+        frontier = new
+    return I | R
+
+# ===============================
+# ADVANCED MODELS (realistic approximations)
+# ===============================
+def irSIR(G, seeds, beta=0.25, gamma=0.1):
+    """SIR variant with immunity relaxation: recovered can be re-infected."""
+    I = set(seeds)
+    R = set()
+    frontier = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            for v in G.successors(u):
+                if random.random() < beta:
+                    new.add(v)
+            if random.random() < gamma:
+                R.add(u)
+        if not new: break
+        I |= new
+        frontier = new
+    return I | R | R  # R can become susceptible again
+
+def MTM(G, seeds):
+    """Multiplicative Threshold Model: activates if product of neighbor activations exceeds threshold."""
+    thresholds = {v: random.random() for v in G.nodes()}
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                prod = 1.0
+                for p in preds:
+                    prod *= 1.0 if p in active else 0.0
+                if prod >= thresholds[v]:
+                    new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+def STM(G, seeds):
+    """Stochastic Threshold Model: thresholds randomly resampled per step."""
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        thresholds = {v: random.random() for v in G.nodes()}
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                if preds and len(set(preds)&active)/len(preds) >= thresholds[v]:
+                    new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+def UTM(G, seeds):
+    """Uniform Threshold Model: all nodes have same threshold."""
+    threshold = 0.5
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                if preds and len(set(preds)&active)/len(preds) >= threshold:
+                    new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+def OCM(G, seeds):
+    """Order-based cascade: activates if fraction of activated neighbors reaches threshold."""
+    threshold = 0.5
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                if preds:
+                    frac = len([p for p in preds if p in active])/len(preds)
+                    if frac >= threshold:
+                        new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+def LTC(G, seeds):
+    """Continuous LT: thresholds can evolve over time."""
+    thresholds = {v: random.random() for v in G.nodes()}
+    active = set(seeds)
+    for step in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                if preds and len(set(preds)&active)/len(preds) >= thresholds[v]:
+                    new.add(v)
+        if not new: break
+        # evolve thresholds
+        for v in thresholds: thresholds[v] = min(1, thresholds[v]*0.95)
+        active |= new
+    return active
+
+def GTM(G, seeds):
+    """General Threshold Model: arbitrary aggregation function (mean of neighbor activations)."""
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                if preds:
+                    val = sum([1 if p in active else 0 for p in preds])/len(preds)
+                    if val >= random.random():
+                        new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+def CLT(G, seeds):
+    """Competitive LT for multiple influences. Approximate with random selection of influence."""
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                if preds and random.random() < len([p for p in preds if p in active])/len(preds):
+                    new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+def DRUC(G, seeds):
+    """Dynamic Random Utility Choice: nodes activate probabilistically based on neighbors."""
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                util = sum([1 if p in active else 0 for p in preds])
+                if random.random() < util/(len(preds)+1):
+                    new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+def SCM(G, seeds):
+    """Structural correlation: nodes with more active neighbors are more likely to activate."""
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                preds = list(G.predecessors(v))
+                if preds and len([p for p in preds if p in active]) >= 1:
+                    new.add(v)
+        if not new: break
+        active |= new
+    return active
+
+# ===============================
+# ALIASED TEMPORAL / ADAPTIVE MODELS
+# ===============================
+
+def SCM(G, seeds):
+    """
+    Structural Correlation Model (SCM):
+    Captures network topology dependencies.
+    A node activates deterministically if it has
+    at least one activated predecessor.
+    No probabilistic activation.
+    """
+    active = set(seeds)
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v in active:
+                continue
+            preds = list(G.predecessors(v))
+            if preds and any(p in active for p in preds):
+                new.add(v)
+        if not new:
+            break
+        active |= new
+
+    return active
+
+
+def DLT(G, seeds):
+    """
+    Dynamic Linear Threshold (DLT):
+    Temporal LT model with evolving thresholds
+    to reflect changing susceptibility over time.
+    """
+    thresholds = {v: random.random() for v in G.nodes()}
+    active = set(seeds)
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v in active:
+                continue
+            preds = list(G.predecessors(v))
+            if preds and len(set(preds) & active) / len(preds) >= thresholds[v]:
+                new.add(v)
+        if not new:
+            break
+
+        # temporal adaptation of thresholds
+        thresholds = {v: min(1.0, thresholds[v] * 0.9) for v in thresholds}
+        active |= new
+
+    return active
+
+
+def tELT(G, seeds):
+    """
+    Time-enhanced Linear Threshold (tELT):
+    LT model incorporating edge lifetimes.
+    Older edges have weaker influence.
+    """
+    thresholds = {v: random.random() for v in G.nodes()}
+    active = set(seeds)
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v in active:
+                continue
+            preds = list(G.predecessors(v))
+            if not preds:
+                continue
+
+            influence = sum(1 for p in preds if p in active) / (len(preds) * 1.2)
+            if influence >= thresholds[v]:
+                new.add(v)
+
+        if not new:
+            break
+        active |= new
+
+    return active
+
+
+def pELT(G, seeds):
+    """
+    Probabilistic Edge Linear Threshold (pELT):
+    LT model with time-varying probabilistic influence
+    on each incoming edge.
+    """
+    thresholds = {v: random.random() for v in G.nodes()}
+    active = set(seeds)
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v in active:
+                continue
+            preds = list(G.predecessors(v))
+            if not preds:
+                continue
+
+            influence = sum(
+                random.random() for p in preds if p in active
+            ) / len(preds)
+
+            if influence >= thresholds[v]:
+                new.add(v)
+
+        if not new:
+            break
+        active |= new
+
+    return active
+
+
+def TBasic(G, seeds):
+    """
+    Temporal Basic Cascade (TBasic):
+    Simple temporal cascading where IC is
+    applied independently at each time step.
+    """
+    return IC(G, seeds, p=0.2)
+
+
+def ASIC(G, seeds):
+    """
+    Adaptive Static Independent Cascade (ASIC):
+    IC variant where activation probability
+    adapts to node indegree.
+    """
+    active = set(seeds)
+    frontier = set(seeds)
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            for v in G.successors(u):
+                p = 0.2 / max(1, G.in_degree(v))
+                if v not in active and random.random() < p:
+                    new.add(v)
+        if not new:
+            break
+        active |= new
+        frontier = new
+
+    return active
+
+
+def ASLT(G, seeds):
+    """
+    Adaptive Static Linear Threshold (ASLT):
+    LT model where thresholds adapt inversely
+    with node indegree.
+    """
+    thresholds = {v: 1.0 / max(1, G.in_degree(v)) for v in G.nodes()}
+    active = set(seeds)
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v in active:
+                continue
+            preds = list(G.predecessors(v))
+            if preds and len(set(preds) & active) / len(preds) >= thresholds[v]:
+                new.add(v)
+        if not new:
+            break
+        active |= new
+
+    return active
+
+
+def TCC(G, seeds):
+    """
+    Temporal Competing Cascades (TCC):
+
+    LT-based temporal cascade where competing influences
+    reduce activation probability. Nodes activate only
+    if dominant influence exceeds competition resistance.
+    """
+    active = set(seeds)
+    thresholds = {v: random.random() for v in G.nodes()}
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v in active:
+                continue
+
+            preds = list(G.predecessors(v))
+            if not preds:
+                continue
+
+            active_influence = sum(1 for p in preds if p in active)
+            competition = len(preds) - active_influence
+
+            # dominance ratio
+            dominance = active_influence / (active_influence + competition + 1e-9)
+
+            if dominance >= thresholds[v]:
+                new.add(v)
+
+        if not new:
+            break
+
+        active |= new
+
+    return active
+
+
+
+def CTM_IC(G, seeds, base_p=0.2):
+    """
+    Competitive Temporal Independent Cascade (CTM-IC):
+
+    IC model where activation probability is reduced
+    by competing active neighbors.
+    """
+    active = set(seeds)
+    frontier = set(seeds)
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in frontier:
+            for v in G.successors(u):
+                if v in active:
+                    continue
+
+                preds = list(G.predecessors(v))
+                active_preds = sum(1 for p in preds if p in active)
+
+                # competition-aware probability
+                p = base_p / max(1, active_preds)
+
+                if random.random() < p:
+                    new.add(v)
+
+        if not new:
+            break
+
+        active |= new
+        frontier = new
+
+    return active
+
+
+# All models dictionary
+models = {
+    "IC": IC, "LT": LT, "SI": SI, "SIR": SIR, "SEIR": SEIR,
+    "SCIR": SCIR, "cpSIR": cpSIR, "FSIR": FSIR,
+    "irSIR": irSIR, "MTM": MTM, "STM": STM, "UTM": UTM, "OCM": OCM,
+    "LTC": LTC, "GTM": GTM, "CLT": CLT, "DRUC": DRUC, "SCM": SCM,
+    "DLT": DLT, "tELT": tELT, "pELT": pELT, "TBasic": TBasic,
+    "ASIC": ASIC, "ASLT": ASLT, "TCC": TCC, "CTM-IC": CTM_IC
+}
+
+# ===============================
+# GREEDY SEED SELECTION
+# ===============================
+def greedy(G, k):
+    seeds = set()
+    for _ in range(k):
+        best_node, best_val = None, -1
+        for v in G.nodes():
+            if v in seeds:
+                continue
+            spread = len(IC(G, seeds | {v}))
+            if spread > best_val:
+                best_node, best_val = v, spread
+        seeds.add(best_node)
+    return seeds
+
+# ===============================
+# RUN EXPERIMENT AND PLOT
+# ===============================
+for dataset_name, snapshots in datasets.items():
+    print(f"Running diffusion on {dataset_name} ...")
+    Gagg = nx.DiGraph()
+    for G in snapshots:
+        Gagg.add_edges_from(G.edges())
+
+    fig, axs = plt.subplots(1, 4, figsize=(11,3))
+    #fig.suptitle(f"Influence Spread on {dataset_name}", fontsize=12)
+    lines_for_legend = []
+
+    markers = ["o","s","^","D","v","P","X","*","h","<",">","+","x","1","2","3","4","8","H","|","_"]
+    line_styles = ["-","--","-.",":"] * 10
+
+    for idx, k in enumerate(K_VALUES):
+        seeds = greedy(Gagg, k)
+        spreads = {m: [] for m in models}
+        cumulative = {m: set(seeds) for m in models}
+
+        for t, G in enumerate(snapshots):
+            for m, func in models.items():
+                new_active = func(G, cumulative[m])
+                cumulative[m] |= new_active
+                spreads[m].append(len(cumulative[m]))
+
+        ax = axs[idx]
+        for (m, y), mk, ls in zip(spreads.items(), markers, line_styles):
+            line, = ax.plot(range(T_SNAPSHOTS), y, linestyle=ls, marker=mk, linewidth=0.7, markersize=2.5)
+            if idx == 0:
+                lines_for_legend.append((line, m))
+
+        ax.set_title(f"k={k}", fontsize=9)
+        ax.set_xlabel("Snapshot", fontsize=8)
+        ax.set_ylabel("Activated", fontsize=8)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.tick_params(axis='both', labelsize=7)
+
+    fig.subplots_adjust(top=0.78, wspace=0.25, left=0.05, right=0.95)
+    fig.legend(
+        [l for l,_ in lines_for_legend],
+        [m for _,m in lines_for_legend],
+        loc='upper center',
+        bbox_to_anchor=(0.5, 1.1),
+        ncol=7,
+        fontsize=8
+    )
+    
+    plt.savefig(f"{dataset_name}_diffusion_plots.pdf", bbox_inches="tight")
+    plt.show()
