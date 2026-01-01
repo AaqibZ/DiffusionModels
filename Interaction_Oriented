@@ -1,0 +1,376 @@
+#INTERACTION ORIENTED MODELS
+import gzip
+import csv
+import random
+import networkx as nx
+import numpy as np
+import matplotlib.pyplot as plt
+from matplotlib.ticker import MaxNLocator
+
+# ===============================
+# PARAMETERS
+# ===============================
+T_SNAPSHOTS = 10
+K_VALUES = [8, 12, 16, 20]
+MAX_STEPS = 8
+SEED = 42
+
+random.seed(SEED)
+np.random.seed(SEED)
+
+# ===============================
+# HELPER FUNCTIONS TO LOAD DATA
+# ===============================
+def load_snap_txt_gz(path):
+    edges = []
+    with gzip.open(path, "rt") as f:
+        for line in f:
+            if line.startswith('#') or not line.strip():
+                continue
+            u, v, t = line.strip().split()[:3]
+            edges.append((int(u), int(v), int(float(t))))
+    return edges
+
+def load_snap_csv_gz(path, min_positive=1):
+    edges = []
+    with gzip.open(path, "rt") as f:
+        reader = csv.reader(f)
+        for row in reader:
+            if row[0].startswith('#') or len(row)<4:
+                continue
+            u, v, rating, t = row[:4]
+            if int(rating) >= min_positive:
+                edges.append((int(u), int(v), int(float(t))))
+    return edges
+
+def build_time_snapshots(edges, n_snapshots=T_SNAPSHOTS):
+    if not edges:
+        return [nx.DiGraph() for _ in range(n_snapshots)]
+
+    all_nodes = set(u for u,v,_ in edges) | set(v for u,v,_ in edges)
+    times = [t for _,_,t in edges]
+    tmin, tmax = min(times), max(times)+1
+    interval = (tmax - tmin)/n_snapshots
+    snapshots = []
+
+    for i in range(n_snapshots):
+        G = nx.DiGraph()
+        G.add_nodes_from(all_nodes)
+        snap_start = tmin + i*interval
+        snap_end = tmin + (i+1)*interval
+        for u, v, t in edges:
+            if snap_start <= t < snap_end:
+                G.add_edge(u, v)
+        snapshots.append(G)
+    return snapshots
+
+# ===============================
+# LOAD DATASETS
+# ===============================
+datasets = {}
+datasets["CollegeMsg"] = build_time_snapshots(load_snap_txt_gz("Datasets/CollegeMsg.txt.gz"))
+datasets["Email-Eu-Core"] = build_time_snapshots(load_snap_txt_gz("Datasets/email-Eu-core-temporal.txt.gz"))
+datasets["Bitcoin-OTC"] = build_time_snapshots(load_snap_csv_gz("Datasets/soc-sign-bitcoinotc.csv.gz"))
+datasets["Bitcoin-Alpha"] = build_time_snapshots(load_snap_csv_gz("Datasets/soc-sign-bitcoinalpha.csv.gz"))
+
+# ===============================
+# DIFFUSION MODELS
+# ===============================
+
+# ===============================
+# PAIRWISE INTERACTION MODELS
+# ===============================
+
+def Voter(G, seeds, p=0.5):
+    """
+    Voter Model:
+    Each node randomly adopts a neighbor's opinion with prob p.
+    Seeds define initial opinion = 1, others = 0.
+    """
+    opinion = {v: (1 if v in seeds else 0) for v in G.nodes()}
+
+    for _ in range(MAX_STEPS):
+        new_opinion = opinion.copy()
+        for v in G.nodes():
+            nbrs = list(G.predecessors(v))
+            if nbrs and random.random() < p:
+                u = random.choice(nbrs)
+                new_opinion[v] = opinion[u]
+        opinion = new_opinion
+
+    return {v for v, o in opinion.items() if o == 1}
+
+
+def EVM(G, seeds):
+    """
+    Extended Voter Model (EVM):
+    Tracks macro adoption across partitions (approximated via degree groups).
+    """
+    opinion = {v: (1 if v in seeds else 0) for v in G.nodes()}
+
+    for _ in range(MAX_STEPS):
+        for v in G.nodes():
+            nbrs = list(G.predecessors(v))
+            if nbrs:
+                weight = sum(opinion[u] for u in nbrs) / len(nbrs)
+                opinion[v] = 1 if random.random() < weight else opinion[v]
+
+    return {v for v, o in opinion.items() if o == 1}
+
+
+def DVM(G, seeds):
+    """
+    Dynamic Voter Model (DVM):
+    Neighbor chosen dynamically at each step.
+    """
+    return Voter(G, seeds, p=0.6)
+
+
+def BDVM(G, seeds):
+    """
+    Biased Dynamic Voter Model (BDVM):
+    Bias toward dominant opinion.
+    """
+    opinion = {v: (1 if v in seeds else 0) for v in G.nodes()}
+
+    for _ in range(MAX_STEPS):
+        for v in G.nodes():
+            nbrs = list(G.predecessors(v))
+            if nbrs:
+                frac = sum(opinion[u] for u in nbrs) / len(nbrs)
+                if frac > 0.6:
+                    opinion[v] = 1
+                elif frac < 0.4:
+                    opinion[v] = 0
+
+    return {v for v, o in opinion.items() if o == 1}
+
+
+def IEM(G, seeds):
+    """
+    Information Exchange Model (IEM):
+    Nodes adopt when expected utility from neighbors exceeds inertia.
+    """
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v in active:
+                continue
+            preds = list(G.predecessors(v))
+            if preds:
+                utility = sum(1 for p in preds if p in active) / len(preds)
+                if utility > 0.5:
+                    new.add(v)
+        if not new:
+            break
+        active |= new
+    return active
+
+
+def OMWTD(G, seeds):
+    """
+    OM-WTD Model:
+    Voter model with heavy-tailed waiting times (slower adoption).
+    """
+    opinion = {v: (1 if v in seeds else 0) for v in G.nodes()}
+
+    for _ in range(MAX_STEPS // 2):  # slowed dynamics
+        for v in G.nodes():
+            if random.random() < 0.3:
+                nbrs = list(G.predecessors(v))
+                if nbrs:
+                    opinion[v] = opinion[random.choice(nbrs)]
+
+    return {v for v, o in opinion.items() if o == 1}
+
+
+# ===============================
+# GROUP-ORIENTED / COMMUNITY MODELS
+# ===============================
+
+def TLRA(G, seeds):
+    """
+    Topic-Leader Rank Approximation:
+    Degree + activity driven influence.
+    """
+    scores = {v: G.degree(v) for v in G.nodes()}
+    leaders = sorted(scores, key=scores.get, reverse=True)[:len(seeds)]
+    return set(leaders)
+
+
+def TAM(G, seeds):
+    """
+    Topic Adoption Model (TAM):
+    Path-based probabilistic adoption.
+    """
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for u in active:
+            for v in G.successors(u):
+                if v not in active and random.random() < 0.2:
+                    new.add(v)
+        if not new:
+            break
+        active |= new
+    return active
+
+
+def POE(G, seeds):
+    """
+    Preference-Oriented Exposure (POE):
+    Personal bias first, social influence later.
+    """
+    active = set(seeds)
+    bias = {v: random.random() for v in G.nodes()}
+
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v in active:
+                continue
+            preds = list(G.predecessors(v))
+            social = len([p for p in preds if p in active]) / max(1, len(preds))
+            if bias[v] * 0.5 + social * 0.5 > 0.5:
+                new.add(v)
+        if not new:
+            break
+        active |= new
+    return active
+
+
+def IncOrder(G, seeds):
+    """
+    Incremental Order-based Community Diffusion.
+    """
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active and G.degree(v) >= np.mean([G.degree(u) for u in active]):
+                new.add(v)
+        if not new:
+            break
+        active |= new
+    return active
+
+
+def LabelCascade(G, seeds):
+    """
+    Label Propagation + Cascade Diffusion.
+    """
+    labels = {v: v for v in G.nodes()}
+    for _ in range(MAX_STEPS):
+        for v in G.nodes():
+            nbrs = list(G.predecessors(v))
+            if nbrs:
+                labels[v] = labels[random.choice(nbrs)]
+    return {v for v, l in labels.items() if l in seeds}
+
+
+def CTMM(G, seeds):
+    """
+    Continuous-Time Markov Model (CTMM):
+    Adoption probability depends on mobility and attractiveness.
+    """
+    active = set(seeds)
+    for _ in range(MAX_STEPS):
+        new = set()
+        for v in G.nodes():
+            if v not in active:
+                rate = G.in_degree(v) / max(1, G.number_of_edges())
+                if random.random() < rate:
+                    new.add(v)
+        if not new:
+            break
+        active |= new
+    return active
+
+
+
+# All models dictionary
+models = {
+    "Voter": Voter,
+    "EVM": EVM,
+    "DVM": DVM,
+    "BDVM": BDVM,
+    "IEM": IEM,
+    "OM-WTD": OMWTD,
+    "TLRA": TLRA,
+    "TAM": TAM,
+    "POE": POE,
+    "IncOrder": IncOrder,
+    "LabelCascade": LabelCascade,
+    "CTMM": CTMM
+}
+
+
+# ===============================
+# GREEDY SEED SELECTION
+# ===============================
+def greedy(G, k):
+    seeds = set()
+    for _ in range(k):
+        best_node, best_val = None, -1
+        for v in G.nodes():
+            if v in seeds:
+                continue
+            spread = len(IC(G, seeds | {v}))
+            if spread > best_val:
+                best_node, best_val = v, spread
+        seeds.add(best_node)
+    return seeds
+
+# ===============================
+# RUN EXPERIMENT AND PLOT
+# ===============================
+for dataset_name, snapshots in datasets.items():
+    print(f"Running diffusion on {dataset_name} ...")
+    Gagg = nx.DiGraph()
+    for G in snapshots:
+        Gagg.add_edges_from(G.edges())
+
+    fig, axs = plt.subplots(1, 4, figsize=(11,3))
+    #fig.suptitle(f"Influence Spread on {dataset_name}", fontsize=12)
+    lines_for_legend = []
+
+    markers = ["o","s","^","D","v","P","X","*","h","<",">","+"]
+    line_styles = ["-","--","-.",":"] * 10
+
+    for idx, k in enumerate(K_VALUES):
+        seeds = greedy(Gagg, k)
+        spreads = {m: [] for m in models}
+        cumulative = {m: set(seeds) for m in models}
+
+        for t, G in enumerate(snapshots):
+            for m, func in models.items():
+                new_active = func(G, cumulative[m])
+                cumulative[m] |= new_active
+                spreads[m].append(len(cumulative[m]))
+
+        ax = axs[idx]
+        for (m, y), mk, ls in zip(spreads.items(), markers, line_styles):
+            line, = ax.plot(range(T_SNAPSHOTS), y, linestyle=ls, marker=mk, linewidth=0.7, markersize=2.5)
+            if idx == 0:
+                lines_for_legend.append((line, m))
+
+        ax.set_title(f"k={k}", fontsize=9)
+        ax.set_xlabel("Snapshot", fontsize=8)
+        ax.set_ylabel("Activated", fontsize=8)
+        ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.yaxis.set_major_locator(MaxNLocator(integer=True))
+        ax.tick_params(axis='both', labelsize=7)
+
+    fig.subplots_adjust(top=0.78, wspace=0.25, left=0.05, right=0.95)
+    fig.legend(
+        [l for l,_ in lines_for_legend],
+        [m for _,m in lines_for_legend],
+        loc='upper center',
+        bbox_to_anchor=(0.5, 1.1),
+        ncol=7,
+        fontsize=8
+    )
+    
+    plt.savefig(f"{dataset_name}_diffusion_plots.pdf", bbox_inches="tight")
+    plt.show()
